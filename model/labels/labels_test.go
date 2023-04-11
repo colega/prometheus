@@ -16,11 +16,15 @@ package labels
 import (
 	"encoding/json"
 	"fmt"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 func TestLabels_String(t *testing.T) {
@@ -800,4 +804,57 @@ func TestMarshaling(t *testing.T) {
 	err = yaml.Unmarshal(b, &gotFY)
 	require.NoError(t, err)
 	require.Equal(t, f, gotFY)
+}
+
+type hashedLabels struct {
+	ls   Labels
+	hash uint64
+}
+
+func TestLabels_HashCollisions(t *testing.T) {
+	const batchSize = 1024
+	workers := runtime.GOMAXPROCS(0)
+	hashes := map[uint64]labels.Labels{}
+	hashed := make(chan [batchSize]hashedLabels, workers)
+	for w := 0; w < workers; w++ {
+		go func() {
+			for {
+				var h [batchSize]hashedLabels
+				for i := 0; i < batchSize; i++ {
+					h[i].ls = FromStrings("uuid", uuid.New().String())
+					h[i].hash = h[i].ls.Hash()
+				}
+				hashed <- h
+			}
+		}()
+	}
+
+	totalBatches := 0
+	last := time.Now()
+	sinceLast := 0
+	for b := range hashed {
+		if totalBatches%1000 == 0 {
+			if time.Since(last) > time.Second {
+				t.Logf("processed %d batches (%d hashes), %d hashes since last:  %4f/s", totalBatches, totalBatches*batchSize, sinceLast, float64(sinceLast)/time.Since(last).Seconds())
+				if totalBatches > 100_000 {
+					hashes = map[uint64]labels.Labels{}
+					runtime.GC()
+					t.Logf("Reset hashes.")
+					totalBatches = 0
+				}
+				last = time.Now()
+				sinceLast = 0
+			}
+
+		}
+		for _, h := range b {
+			if prev, ok := hashes[h.hash]; ok {
+				t.Logf("prev=%s, this=%s, hash=%d", prev, h.ls, h.hash)
+				t.Fail()
+			}
+			hashes[h.hash] = h.ls
+			sinceLast++
+		}
+		totalBatches++
+	}
 }
