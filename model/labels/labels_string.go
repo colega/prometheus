@@ -430,6 +430,9 @@ func Compare(a, b Labels) int {
 	if len(b.data) < len(a.data) {
 		shorter, longer = b.data, a.data
 	}
+	if len(shorter) == 0 {
+		return len(longer)
+	}
 	i := 0
 	_ = longer[len(shorter)-1] // Get compiler to do bounds-check on longer just once here.
 	for ; i < len(shorter); i++ {
