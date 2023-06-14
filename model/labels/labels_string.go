@@ -434,6 +434,13 @@ func Compare(a, b Labels) int {
 		return len(longer)
 	}
 	i := 0
+	p := (*reflect.StringHeader)(unsafe.Pointer(&shorter)).Data
+	q := (*reflect.StringHeader)(unsafe.Pointer(&longer)).Data
+	for ; i < len(shorter)-8; i += 8 {
+		if *(*uint64)(unsafe.Pointer(p + uintptr(i))) != *(*uint64)(unsafe.Pointer(q + uintptr(i))) {
+			break
+		}
+	}
 	_ = longer[len(shorter)-1] // Get compiler to do bounds-check on longer just once here.
 	for ; i < len(shorter); i++ {
 		if shorter[i] != longer[i] {
