@@ -434,10 +434,10 @@ func Compare(a, b Labels) int {
 		return len(longer)
 	}
 	i := 0
-	p := (*reflect.StringHeader)(unsafe.Pointer(&shorter)).Data
-	q := (*reflect.StringHeader)(unsafe.Pointer(&longer)).Data
+	sp := unsafe.Pointer((*reflect.StringHeader)(unsafe.Pointer(&shorter)).Data)
+	lp := unsafe.Pointer((*reflect.StringHeader)(unsafe.Pointer(&longer)).Data)
 	for ; i < len(shorter)-8; i += 8 {
-		if *(*uint64)(unsafe.Pointer(p + uintptr(i))) != *(*uint64)(unsafe.Pointer(q + uintptr(i))) {
+		if *(*uint64)(unsafe.Add(sp, i)) != *(*uint64)(unsafe.Add(lp, i)) {
 			break
 		}
 	}
@@ -447,6 +447,7 @@ func Compare(a, b Labels) int {
 			break
 		}
 	}
+
 	firstCharDifferent := i
 	if firstCharDifferent == len(shorter) {
 		if len(shorter) == len(longer) {
