@@ -31,6 +31,7 @@ const (
 	EncXOR
 	EncHistogram
 	EncFloatHistogram
+	EncVarint
 )
 
 func (e Encoding) String() string {
@@ -43,13 +44,15 @@ func (e Encoding) String() string {
 		return "histogram"
 	case EncFloatHistogram:
 		return "floathistogram"
+	case EncVarint:
+		return "varint"
 	}
 	return "<unknown>"
 }
 
 // IsValidEncoding returns true for supported encodings.
 func IsValidEncoding(e Encoding) bool {
-	return e == EncXOR || e == EncHistogram || e == EncFloatHistogram
+	return e == EncXOR || e == EncHistogram || e == EncFloatHistogram || e == EncVarint
 }
 
 // Chunk holds a sequence of sample pairs that can be iterated over and appended to.
@@ -226,6 +229,7 @@ type pool struct {
 	xor            sync.Pool
 	histogram      sync.Pool
 	floatHistogram sync.Pool
+	varint         sync.Pool
 }
 
 // NewPool returns a new pool.
@@ -246,6 +250,11 @@ func NewPool() Pool {
 				return &FloatHistogramChunk{b: bstream{}}
 			},
 		},
+		varint: sync.Pool{
+			New: func() interface{} {
+				return &VarintChunk{b: bstream{}}
+			},
+		},
 	}
 }
 
@@ -263,6 +272,11 @@ func (p *pool) Get(e Encoding, b []byte) (Chunk, error) {
 		return c, nil
 	case EncFloatHistogram:
 		c := p.floatHistogram.Get().(*FloatHistogramChunk)
+		c.b.stream = b
+		c.b.count = 0
+		return c, nil
+	case EncVarint:
+		c := p.varint.Get().(*VarintChunk)
 		c.b.stream = b
 		c.b.count = 0
 		return c, nil
@@ -305,6 +319,17 @@ func (p *pool) Put(c Chunk) error {
 		sh.b.stream = nil
 		sh.b.count = 0
 		p.floatHistogram.Put(c)
+	case EncVarint:
+		vi, ok := c.(*VarintChunk)
+		// This may happen often with wrapped chunks. Nothing we can really do about
+		// it but returning an error would cause a lot of allocations again. Thus,
+		// we just skip it.
+		if !ok {
+			return nil
+		}
+		vi.b.stream = nil
+		vi.b.count = 0
+		p.varint.Put(c)
 	default:
 		return errors.Errorf("invalid chunk encoding %q", c.Encoding())
 	}
@@ -322,6 +347,8 @@ func FromData(e Encoding, d []byte) (Chunk, error) {
 		return &HistogramChunk{b: bstream{count: 0, stream: d}}, nil
 	case EncFloatHistogram:
 		return &FloatHistogramChunk{b: bstream{count: 0, stream: d}}, nil
+	case EncVarint:
+		return &VarintChunk{b: bstream{count: 0, stream: d}}, nil
 	}
 	return nil, errors.Errorf("invalid chunk encoding %q", e)
 }
@@ -335,6 +362,8 @@ func NewEmptyChunk(e Encoding) (Chunk, error) {
 		return NewHistogramChunk(), nil
 	case EncFloatHistogram:
 		return NewFloatHistogramChunk(), nil
+	case EncVarint:
+		return NewVarintChunk(), nil
 	}
 	return nil, errors.Errorf("invalid chunk encoding %q", e)
 }
