@@ -1134,7 +1134,12 @@ type chunkOpts struct {
 // isolation for this append.)
 // It is unsafe to call this concurrently with s.iterator(...) without holding the series lock.
 func (s *memSeries) append(t int64, v float64, appendID uint64, o chunkOpts) (sampleInOrder, chunkCreated bool) {
-	c, sampleInOrder, chunkCreated := s.appendPreprocessor(t, chunkenc.EncXOR, o)
+	e := chunkenc.EncXOR
+	if s.sawNonInts = s.sawNonInts || float64(int64(v)) != v; !s.sawNonInts {
+		e = chunkenc.EncVarint
+	}
+
+	c, sampleInOrder, chunkCreated := s.appendPreprocessor(t, e, o)
 	if !sampleInOrder {
 		return sampleInOrder, chunkCreated
 	}
@@ -1156,6 +1161,10 @@ func (s *memSeries) append(t int64, v float64, appendID uint64, o chunkOpts) (sa
 // appendHistogram adds the histogram.
 // It is unsafe to call this concurrently with s.iterator(...) without holding the series lock.
 func (s *memSeries) appendHistogram(t int64, h *histogram.Histogram, appendID uint64, o chunkOpts) (sampleInOrder, chunkCreated bool) {
+	if !s.sawNonInts {
+		s.sawNonInts = true
+	}
+
 	// Head controls the execution of recoding, so that we own the proper
 	// chunk reference afterwards. We check for Appendable from appender before
 	// appendPreprocessor because in case it ends up creating a new chunk,
@@ -1250,6 +1259,10 @@ func (s *memSeries) appendHistogram(t int64, h *histogram.Histogram, appendID ui
 // appendFloatHistogram adds the float histogram.
 // It is unsafe to call this concurrently with s.iterator(...) without holding the series lock.
 func (s *memSeries) appendFloatHistogram(t int64, fh *histogram.FloatHistogram, appendID uint64, o chunkOpts) (sampleInOrder, chunkCreated bool) {
+	if !s.sawNonInts {
+		s.sawNonInts = true
+	}
+
 	// Head controls the execution of recoding, so that we own the proper
 	// chunk reference afterwards.  We check for Appendable from appender before
 	// appendPreprocessor because in case it ends up creating a new chunk,

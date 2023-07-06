@@ -1917,6 +1917,7 @@ type memSeries struct {
 	mmappedChunks []*mmappedChunk
 	headChunk     *memChunk          // Most recent chunk in memory that's still being built.
 	firstChunkID  chunks.HeadChunkID // HeadChunkID for mmappedChunks[0]
+	sawNonInts    bool               // Whether we've seen non-integer samples.
 
 	ooo *memSeriesOOOFields
 
