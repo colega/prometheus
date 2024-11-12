@@ -251,7 +251,6 @@ Outer:
 				idx := uint64(mSeries.ref) % uint64(concurrency)
 				processors[idx].input <- walSubsetProcessorInputItem{walSeriesRef: walSeries.Ref, existingSeries: mSeries}
 			}
-			h.postings.Commit()
 			seriesPool.Put(v)
 		case []record.RefSample:
 			samples := v
@@ -1519,7 +1518,6 @@ func (h *Head) loadChunkSnapshot() (int, int, map[chunks.HeadSeriesRef]*memSerie
 				for range rc {
 				}
 			}()
-			defer h.postings.Commit()
 
 			shardedRefSeries[idx] = make(map[chunks.HeadSeriesRef]*memSeries)
 			localRefSeries := shardedRefSeries[idx]

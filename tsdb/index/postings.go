@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"github.com/bboreham/go-loser"
+	"github.com/cespare/xxhash/v2"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
@@ -42,14 +43,6 @@ func AllPostingsKey() (name, value string) {
 // ensureOrderBatchSize is the max number of postings passed to a worker in a single batch in MemPostings.EnsureOrder().
 const ensureOrderBatchSize = 1024
 
-// ensureOrderBatchPool is a pool used to recycle batches passed to workers in MemPostings.EnsureOrder().
-var ensureOrderBatchPool = sync.Pool{
-	New: func() interface{} {
-		x := make([][]storage.SeriesRef, 0, ensureOrderBatchSize)
-		return &x // Return pointer type as preferred by Pool.
-	},
-}
-
 // MemPostings holds postings list for series ID per label pair. They may be written
 // to out of order.
 // EnsureOrder() must be called once before any reads are done. This allows for quick
@@ -59,6 +52,8 @@ type MemPostings struct {
 	m       map[string]map[string][]storage.SeriesRef
 	ordered bool
 
+	// pendingMtx protects pending.
+	// If both pendingMtx and mtx need to be taken, mtx should be locked first.
 	pendingMtx sync.Mutex
 	pending    []pendingMemPostings
 }
@@ -237,65 +232,6 @@ func (p *MemPostings) All() Postings {
 	return p.Get(AllPostingsKey())
 }
 
-// EnsureOrder ensures that all postings lists are sorted. After it returns all further
-// calls to add and addFor will insert new IDs in a sorted manner.
-// Parameter numberOfConcurrentProcesses is used to specify the maximal number of
-// CPU cores used for this operation. If it is <= 0, GOMAXPROCS is used.
-// GOMAXPROCS was the default before introducing this parameter.
-func (p *MemPostings) EnsureOrder(numberOfConcurrentProcesses int) {
-	p.mtx.Lock()
-	defer p.mtx.Unlock()
-
-	if p.ordered {
-		return
-	}
-
-	concurrency := numberOfConcurrentProcesses
-	if concurrency <= 0 {
-		concurrency = runtime.GOMAXPROCS(0)
-	}
-	workc := make(chan *[][]storage.SeriesRef)
-
-	var wg sync.WaitGroup
-	wg.Add(concurrency)
-
-	for i := 0; i < concurrency; i++ {
-		go func() {
-			for job := range workc {
-				for _, l := range *job {
-					slices.Sort(l)
-				}
-
-				*job = (*job)[:0]
-				ensureOrderBatchPool.Put(job)
-			}
-			wg.Done()
-		}()
-	}
-
-	nextJob := ensureOrderBatchPool.Get().(*[][]storage.SeriesRef)
-	for _, e := range p.m {
-		for _, l := range e {
-			*nextJob = append(*nextJob, l)
-
-			if len(*nextJob) >= ensureOrderBatchSize {
-				workc <- nextJob
-				nextJob = ensureOrderBatchPool.Get().(*[][]storage.SeriesRef)
-			}
-		}
-	}
-
-	// If the last job was partially filled, we need to push it to workers too.
-	if len(*nextJob) > 0 {
-		workc <- nextJob
-	}
-
-	close(workc)
-	wg.Wait()
-
-	p.ordered = true
-}
-
 // Delete removes all ids in the given map from the postings lists.
 // affectedLabels contains all the labels that are affected by the deletion, there's no need to check other labels.
 func (p *MemPostings) Delete(deleted map[storage.SeriesRef]struct{}, affected map[labels.Label]struct{}) {
@@ -382,11 +318,16 @@ func (p *MemPostings) Add(id storage.SeriesRef, lset labels.Labels) {
 // Commit will create the entries for all series pending to be committed.
 // Commit is a noop if there are no pending entries.
 func (p *MemPostings) Commit() {
-	p.pendingMtx.Lock()
-	defer p.pendingMtx.Unlock()
-
 	p.mtx.Lock()
 	defer p.mtx.Unlock()
+	if !p.ordered {
+		// Committing unordered would have a great performance impact.
+		// Since unordered postings can't be used for queries anyway, it doesn't matter if we don't commit them yet.
+		return
+	}
+
+	p.pendingMtx.Lock()
+	defer p.pendingMtx.Unlock()
 
 	for i := range p.pending {
 		p.pending[i].lset.Range(func(l labels.Label) {
@@ -435,6 +376,78 @@ func (p *MemPostings) addFor(id storage.SeriesRef, l labels.Label) {
 		}
 		list[i], list[i-1] = list[i-1], list[i]
 	}
+}
+
+// EnsureOrderAndCommit ensures that pending postings are ordered and commits them.
+// After calling EnsureOrderAndCommit, next Commit() calls will add new IDs in a sorted manner.
+func (p *MemPostings) EnsureOrderAndCommit(numberOfConcurrentProcesses int) {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	if p.ordered {
+		return
+	}
+	defer func() { p.ordered = true }()
+
+	if numberOfConcurrentProcesses <= 0 {
+		numberOfConcurrentProcesses = runtime.GOMAXPROCS(0)
+	}
+
+	p.pendingMtx.Lock()
+	defer p.pendingMtx.Unlock()
+
+	slices.SortFunc(p.pending, func(a, b pendingMemPostings) int {
+		if a.id < b.id {
+			return -1
+		} else if b.id > a.id {
+			return 1
+		}
+		return 0
+	})
+
+	type labelValueJob struct {
+		lm  map[string][]storage.SeriesRef
+		lv  string
+		ref storage.SeriesRef
+	}
+
+	chans := make([]chan labelValueJob, numberOfConcurrentProcesses)
+	wg := sync.WaitGroup{}
+	for w := 0; w < numberOfConcurrentProcesses; w++ {
+		wg.Add(1)
+		chans[w] = make(chan labelValueJob, ensureOrderBatchSize)
+		go func(ch <-chan labelValueJob) {
+			defer wg.Done()
+			for job := range ch {
+				job.lm[job.lv] = appendWithExponentialGrowth(job.lm[job.lv], job.ref)
+			}
+		}(chans[w])
+	}
+
+	// We know allPostingsKey will have at least len(p.pending) elements.
+	allPostingsKeyMap := map[string][]storage.SeriesRef{
+		allPostingsKey.Value: make([]storage.SeriesRef, 0, len(p.pending)),
+	}
+	p.m[allPostingsKey.Name] = allPostingsKeyMap
+
+	for i := range p.pending {
+		chans[0] <- labelValueJob{lm: allPostingsKeyMap, lv: allPostingsKey.Value, ref: p.pending[i].id}
+		p.pending[i].lset.Range(func(l labels.Label) {
+			lm, ok := p.m[l.Name]
+			if !ok {
+				lm = make(map[string][]storage.SeriesRef)
+				p.m[l.Name] = lm
+			}
+			h := xxhash.Sum64String(l.Name)
+			chans[int(h%math.MaxUint32)%numberOfConcurrentProcesses] <- labelValueJob{lm: lm, lv: l.Value, ref: p.pending[i].id}
+		})
+	}
+	for w := 0; w < numberOfConcurrentProcesses; w++ {
+		close(chans[w])
+	}
+	wg.Wait()
+
+	// Reset pending to a decent size, as it grew a lot during WAL replay.
+	p.pending = make([]pendingMemPostings, 0, 10e3)
 }
 
 func (p *MemPostings) PostingsForLabelMatching(ctx context.Context, name string, match func(string) bool) Postings {

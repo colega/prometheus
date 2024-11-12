@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -44,29 +45,27 @@ func TestMemPostings_addFor(t *testing.T) {
 	require.Equal(t, []storage.SeriesRef{1, 2, 3, 4, 5, 6, 7, 8}, p.m[allPostingsKey.Name][allPostingsKey.Value])
 }
 
-func TestMemPostings_ensureOrder(t *testing.T) {
+func TestMemPostings_ensureOrderAndCommit(t *testing.T) {
 	p := NewUnorderedMemPostings()
-	p.m["a"] = map[string][]storage.SeriesRef{}
 
-	for i := 0; i < 100; i++ {
-		l := make([]storage.SeriesRef, 100)
-		for j := range l {
-			l[j] = storage.SeriesRef(rand.Uint64())
-		}
-		v := strconv.Itoa(i)
-
-		p.m["a"][v] = l
+	for i := 0; i < 10; i++ {
+		p.Add(storage.SeriesRef(rand.Uint64()), labels.FromStrings("lbl", "val"))
 	}
 
-	p.EnsureOrder(0)
+	p.EnsureOrderAndCommit(0)
 
-	for _, e := range p.m {
-		for _, l := range e {
-			ok := sort.SliceIsSorted(l, func(i, j int) bool {
-				return l[i] < l[j]
-			})
-			require.True(t, ok, "postings list %v is not sorted", l)
-		}
+	{
+		ps := p.Get(allPostingsKey.Name, allPostingsKey.Value)
+		ep, err := ExpandPostings(ps)
+		require.NoError(t, err)
+		require.True(t, slices.IsSorted(ep), "allPostingsKey postings are not sorted: %v", ep)
+	}
+
+	{
+		ps := p.Get("lbl", "val")
+		ep, err := ExpandPostings(ps)
+		require.NoError(t, err)
+		require.True(t, slices.IsSorted(ep), "lbl=val postings are not sorted: %v", ep)
 	}
 }
 
@@ -116,7 +115,7 @@ func BenchmarkMemPostings_ensureOrder(b *testing.B) {
 			b.ResetTimer()
 
 			for n := 0; n < b.N; n++ {
-				p.EnsureOrder(0)
+				p.EnsureOrderAndCommit(0)
 				p.ordered = false
 			}
 		})
