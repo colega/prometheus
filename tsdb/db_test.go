@@ -9517,3 +9517,88 @@ func TestBlockClosingBlockedDuringRemoteRead(t *testing.T) {
 	case <-blockClosed:
 	}
 }
+
+func TestHead_RaceWritingWalSeriesBetweenTwoAppenders(t *testing.T) {
+	const appenders = 2
+	const batchSize = 100
+	const batchesNum = 1000
+	const totalSeries = batchesNum * batchSize
+
+	series := make([]labels.Labels, totalSeries)
+	for i := 0; i < totalSeries; i++ {
+		series[i] = labels.FromStrings("foo", strconv.Itoa(i))
+	}
+
+	opts := DefaultOptions()
+	opts.OutOfOrderTimeWindow = 1000
+	db := openTestDB(t, opts, nil)
+	ctx := context.Background()
+
+	type batch struct {
+		sync.WaitGroup
+		start chan struct{}
+	}
+	batches := make([]batch, batchesNum)
+	for i := range batches {
+		batches[i].start = make(chan struct{})
+		batches[i].Add(2)
+	}
+
+	for i := 0; i < appenders; i++ {
+		go func(index int) {
+			for bi := range batches {
+				<-batches[bi].start
+
+				app := db.Appender(ctx)
+				for i := 0; i < batchSize; i++ {
+					_, err := app.Append(0, series[bi*batchSize+i], 100+int64(index), float64(index))
+					if err != nil {
+						t.Errorf("Failed to append: %v", err)
+						batches[bi].Done()
+						return
+					}
+				}
+				if err := app.Commit(); err != nil {
+					t.Errorf("Failed to commit: %v", err)
+					batches[bi].Done()
+					return
+				}
+
+				batches[bi].Done()
+			}
+		}(i)
+	}
+
+	for i := range batches {
+		close(batches[i].start)
+		batches[i].Wait()
+	}
+
+	// Our assertion is that each one of totalSeries has 2 samples.
+	{
+		q, err := db.Querier(0, 200)
+		require.NoError(t, err)
+		res := query(t, q, labels.MustNewMatcher(labels.MatchRegexp, "foo", ".+"))
+		require.Lenf(t, res, totalSeries, "There should be %d total series in the result", totalSeries)
+		for series, samples := range res {
+			require.Lenf(t, samples, 2, "Series %q should have 2 samples", series)
+		}
+	}
+
+	// Close and reopen DB.
+	require.NoError(t, db.Close())
+	db, err := Open(db.Dir(), nil, nil, opts, nil)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, db.Close()) }()
+
+	// Check again that each one of totalSeries has 2 samples.
+	{
+		q, err := db.Querier(0, 200)
+		require.NoError(t, err)
+		res := query(t, q, labels.MustNewMatcher(labels.MatchRegexp, "foo", ".+"))
+		require.Lenf(t, res, totalSeries, "There should be %d total series in the result", totalSeries)
+		for series, samples := range res {
+			require.Lenf(t, samples, 2, "Series %q should have 2 samples", series)
+		}
+	}
+}
