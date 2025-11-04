@@ -826,6 +826,7 @@ func (cdm *ChunkDiskMapper) IterateAllChunks(f func(seriesRef HeadSeriesRef, chu
 		segIDs = append(segIDs, seg)
 	}
 	slices.Sort(segIDs)
+	var lastIdx int
 	for _, segID := range segIDs {
 		mmapFile := cdm.mmappedChunkFiles[segID]
 		fileEnd := mmapFile.byteSlice.Len()
@@ -926,6 +927,36 @@ func (cdm *ChunkDiskMapper) IterateAllChunks(f func(seriesRef HeadSeriesRef, chu
 				Err:       fmt.Errorf("head chunk file doesn't include enough bytes to read the last chunk data - required:%v, available:%v, file:%d", idx, fileEnd, segID),
 			}
 		}
+		lastIdx = idx
+	}
+
+	// Initialize offset and reopen the last file for writing.
+	// This prevents shouldCutNewFile() from incorrectly triggering on the first
+	// write after restart due to offset being 0.
+	if len(segIDs) > 0 {
+		lastSegID := segIDs[len(segIDs)-1]
+
+		// Reopen the last file for appending
+		lastFileName := segmentFile(cdm.dir.Name(), lastSegID)
+		f, err := os.OpenFile(lastFileName, os.O_WRONLY|os.O_APPEND, 0666)
+		if err != nil {
+			return fmt.Errorf("failed to reopen last chunk file %s: %w", lastFileName, err)
+		}
+
+		// Set up the write state
+		cdm.curFile = f
+		cdm.curFileSequence = lastSegID
+		cdm.curFileOffset.Store(uint64(lastIdx))
+		if cdm.chkWriter != nil {
+			cdm.chkWriter.Reset(f)
+		} else {
+			cdm.chkWriter = bufio.NewWriterSize(f, cdm.writeBufferSize)
+		}
+
+		// Initialize evtlPos offset
+		cdm.evtlPosMtx.Lock()
+		cdm.evtlPos.offset = uint64(lastIdx)
+		cdm.evtlPosMtx.Unlock()
 	}
 
 	return nil

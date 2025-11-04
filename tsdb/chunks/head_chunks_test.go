@@ -240,26 +240,28 @@ func TestChunkDiskMapper_Truncate(t *testing.T) {
 	hrw = createChunkDiskMapper(t, dir)
 
 	verifyFiles([]int{3, 4, 5, 6, 7, 8})
-	// New file is created after restart even if last file was empty.
+	// After restart, chunks should append to the last file (8) instead of creating a new file.
+	// This is the fix for the offset initialization bug.
 	addChunk()
-	verifyFiles([]int{3, 4, 5, 6, 7, 8, 9})
+	verifyFiles([]int{3, 4, 5, 6, 7, 8})
 
 	// Truncating files after restart.
 	require.NoError(t, hrw.Truncate(6))
-	verifyFiles([]int{6, 7, 8, 9})
+	verifyFiles([]int{6, 7, 8})
 
 	// Truncating a second time without adding a chunk shouldn't create a new file.
 	require.NoError(t, hrw.Truncate(6))
-	verifyFiles([]int{6, 7, 8, 9})
+	verifyFiles([]int{6, 7, 8})
 
 	// Add a chunk to trigger cutting of new file.
+	// Truncate() closed the current file (8), so the next write creates a new file (9).
 	addChunk()
 
-	verifyFiles([]int{6, 7, 8, 9, 10})
+	verifyFiles([]int{6, 7, 8, 9})
 
 	// Truncation by file number.
 	require.NoError(t, hrw.Truncate(8))
-	verifyFiles([]int{8, 9, 10})
+	verifyFiles([]int{8, 9})
 
 	// Truncating till current time should not delete the current active file.
 	require.NoError(t, hrw.Truncate(10))
@@ -267,7 +269,7 @@ func TestChunkDiskMapper_Truncate(t *testing.T) {
 	// Add a chunk to trigger cutting of new file.
 	addChunk()
 
-	verifyFiles([]int{10, 11}) // One file is the previously active file and one currently created.
+	verifyFiles([]int{9, 10}) // File 9 was the active file; truncate cut it, so now we have 9 and new file 10.
 }
 
 // TestChunkDiskMapper_Truncate_PreservesFileSequence tests that truncation doesn't poke
@@ -580,4 +582,117 @@ func createChunk(t *testing.T, idx int, hrw *ChunkDiskMapper) (seriesRef HeadSer
 	})
 	<-awaitCb
 	return
+}
+
+// TestChunkDiskMapper_OffsetInitializationBug verifies that evtlPos.offset
+// is properly initialized after reopening existing chunk files.
+//
+// Previously, when Prometheus restarted and loaded existing chunk files via openMMapFiles(),
+// it only set evtlPos.seq but left evtlPos.offset at 0. On the first chunk write
+// after restart, shouldCutNewFile() would see offset==0 and incorrectly think a new file
+// was needed, causing a sequence number mismatch panic:
+// "expected newly cut file to have sequence:offset X:Y, got A:B"
+//
+// The fix initializes evtlPos.offset to the current file size after reopening,
+// ensuring chunks continue to append to the existing file.
+func TestChunkDiskMapper_OffsetInitializationBug(t *testing.T) {
+	dir := t.TempDir()
+
+	// Step 1: Create ChunkDiskMapper and write some chunks to the first file.
+	// We want to write enough to have data in the file, but not enough to trigger
+	// a new file (MaxHeadChunkFileSize is 512 MiB).
+	hrw1, err := NewChunkDiskMapper(nil, dir, chunkenc.NewPool(), DefaultWriteBufferSize, writeQueueSize)
+	require.NoError(t, err)
+	require.NoError(t, hrw1.IterateAllChunks(func(HeadSeriesRef, ChunkDiskMapperRef, int64, int64, uint16, chunkenc.Encoding, bool) error {
+		return nil
+	}))
+
+	// Write 10 chunks to the first file.
+	for i := 0; i < 10; i++ {
+		seriesRef := HeadSeriesRef(i + 1)
+		mint := int64(i * 1000)
+		maxt := int64((i + 1) * 1000)
+		chunk := randomChunk(t)
+		awaitCb := make(chan struct{})
+
+		_ = hrw1.WriteChunk(seriesRef, mint, maxt, chunk, false, func(err error) {
+			require.NoError(t, err)
+			close(awaitCb)
+		})
+		<-awaitCb
+	}
+
+	// Verify we're still on the first file (sequence 1).
+	require.Equal(t, 1, hrw1.curFileSequence, "should still be on first chunk file")
+
+	// Get the current offset position after writing 10 chunks.
+	hrw1.evtlPosMtx.Lock()
+	expectedSeq := hrw1.evtlPos.seq
+	expectedOffset := hrw1.evtlPos.offset
+	hrw1.evtlPosMtx.Unlock()
+
+	require.Greater(t, expectedOffset, uint64(HeadChunkFileHeaderSize),
+		"offset should be greater than header size after writing chunks")
+
+	// Close to simulate a restart.
+	require.NoError(t, hrw1.Close())
+
+	// Step 2: Reopen ChunkDiskMapper - this triggers openMMapFiles() which has the bug.
+	hrw2, err := NewChunkDiskMapper(nil, dir, chunkenc.NewPool(), DefaultWriteBufferSize, writeQueueSize)
+	require.NoError(t, err)
+	require.NoError(t, hrw2.IterateAllChunks(func(HeadSeriesRef, ChunkDiskMapperRef, int64, int64, uint16, chunkenc.Encoding, bool) error {
+		return nil
+	}))
+	defer func() {
+		require.NoError(t, hrw2.Close())
+	}()
+
+	// Verify the bug: evtlPos.offset is 0 after reopening!
+	hrw2.evtlPosMtx.Lock()
+	actualSeq := hrw2.evtlPos.seq
+	actualOffset := hrw2.evtlPos.offset
+	hrw2.evtlPosMtx.Unlock()
+
+	t.Logf("After reopen: evtlPos.seq=%d, evtlPos.offset=%d", actualSeq, actualOffset)
+	t.Logf("Expected: seq=%d, offset=%d (from before close)", expectedSeq, expectedOffset)
+
+	// Verify that offset is properly initialized after reopening.
+	require.Equal(t, expectedSeq, actualSeq,
+		"evtlPos.seq should be preserved after reopening")
+
+	// The offset should be initialized to a reasonable value (not 0).
+	// It should be at least as large as the header size, and close to the expected offset.
+	// Note: The exact value might differ slightly due to buffering and write queue behavior,
+	// but it should be in the same ballpark (within a few KB).
+	require.Greater(t, actualOffset, uint64(HeadChunkFileHeaderSize),
+		"evtlPos.offset should be initialized after reopening (not 0)")
+	require.InDelta(t, float64(expectedOffset), float64(actualOffset), 5000,
+		"evtlPos.offset should be close to the expected value after reopening")
+
+	// Step 3: Write one more chunk - with the fix, this should append to the existing file.
+
+	seriesRef := HeadSeriesRef(11)
+	mint := int64(10 * 1000)
+	maxt := int64(11 * 1000)
+	chunk := randomChunk(t)
+	awaitCb := make(chan struct{})
+
+	// With the fix, this write should append to the existing file (sequence 1).
+	chunkRef := hrw2.WriteChunk(seriesRef, mint, maxt, chunk, false, func(err error) {
+		require.NoError(t, err)
+		close(awaitCb)
+	})
+	<-awaitCb
+
+	t.Logf("Wrote chunk with ref: %v", chunkRef)
+
+	// Verify the fix: the chunk should still be on file 1.
+	// We only wrote 11 small chunks (far below the 512 MiB MaxHeadChunkFileSize).
+	require.Equal(t, 1, hrw2.curFileSequence,
+		"chunk should continue on sequence 1 after fix")
+
+	// The chunk reference should show it was written to file 1.
+	chunkSeq, _ := chunkRef.Unpack()
+	require.Equal(t, 1, int(chunkSeq),
+		"chunk should be written to file 1 after fix")
 }
