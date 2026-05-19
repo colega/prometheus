@@ -1650,6 +1650,7 @@ type StaleHead struct {
 }
 
 // NewStaleHead returns a *StaleHead.
+// staleSeriesRefs must be in order.
 func NewStaleHead(head *Head, mint, maxt int64, staleSeriesRefs []storage.SeriesRef) *StaleHead {
 	return &StaleHead{
 		RangeHead: RangeHead{

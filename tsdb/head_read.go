@@ -215,6 +215,8 @@ func (h *headIndexReader) Series(ref storage.SeriesRef, builder *labels.ScratchB
 	return nil
 }
 
+// staleIndex builds a new headStaleIndexReader.
+// staleSeriesRefs must be in order.
 func (h *Head) staleIndex(mint, maxt int64, staleSeriesRefs []storage.SeriesRef) (*headStaleIndexReader, error) {
 	return &headStaleIndexReader{
 		headIndexReader: h.indexRange(mint, maxt),
@@ -263,7 +265,7 @@ func (h *headStaleIndexReader) PostingsForAllLabelValues(ctx context.Context, na
 // filterStaleSeriesAndSortPostings returns the stale series references from the given postings
 // that also do not have any out-of-order data.
 func (h *Head) filterStaleSeriesAndSortPostings(p index.Postings) ([]storage.SeriesRef, error) {
-	series := make([]*memSeries, 0, 1024)
+	refs := make([]storage.SeriesRef, 0, 1024)
 
 	notFoundSeriesCount := 0
 	for p.Next() {
@@ -284,7 +286,7 @@ func (h *Head) filterStaleSeriesAndSortPostings(p index.Postings) ([]storage.Ser
 		if value.IsStaleNaN(s.lastValue) ||
 			(s.lastHistogramValue != nil && value.IsStaleNaN(s.lastHistogramValue.Sum)) ||
 			(s.lastFloatHistogramValue != nil && value.IsStaleNaN(s.lastFloatHistogramValue.Sum)) {
-			series = append(series, s)
+			refs = append(refs, p.At())
 		}
 		s.Unlock()
 	}
@@ -293,15 +295,6 @@ func (h *Head) filterStaleSeriesAndSortPostings(p index.Postings) ([]storage.Ser
 	}
 	if err := p.Err(); err != nil {
 		return nil, fmt.Errorf("expand postings: %w", err)
-	}
-
-	slices.SortFunc(series, func(a, b *memSeries) int {
-		return labels.Compare(a.labels(), b.labels())
-	})
-
-	refs := make([]storage.SeriesRef, 0, len(series))
-	for _, p := range series {
-		refs = append(refs, storage.SeriesRef(p.ref))
 	}
 	return refs, nil
 }
