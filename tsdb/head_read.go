@@ -232,34 +232,32 @@ type headStaleIndexReader struct {
 }
 
 func (h *headStaleIndexReader) Postings(ctx context.Context, name string, values ...string) (index.Postings, error) {
-	// If all postings are requested, return the precalculated list.
+	// If all postings are requested, return the precalculated list, this is what is used for compaction.
 	k, v := index.AllPostingsKey()
 	if len(h.staleSeriesRefs) > 0 && name == k && len(values) == 1 && values[0] == v {
 		return index.NewListPostings(h.staleSeriesRefs), nil
 	}
-	seriesRefs, err := h.head.filterStaleSeriesAndSortPostings(h.head.postings.Postings(ctx, name, values...))
-	if err != nil {
-		return index.ErrPostings(err), err
-	}
-	return index.NewListPostings(seriesRefs), nil
+	// Unused for compaction, so we don't need to optimise.
+	return index.Intersect(
+		index.NewListPostings(h.staleSeriesRefs),
+		h.head.postings.Postings(ctx, name, values...),
+	), nil
 }
 
 func (h *headStaleIndexReader) PostingsForLabelMatching(ctx context.Context, name string, match func(string) bool) index.Postings {
 	// Unused for compaction, so we don't need to optimise.
-	seriesRefs, err := h.head.filterStaleSeriesAndSortPostings(h.head.postings.PostingsForLabelMatching(ctx, name, match))
-	if err != nil {
-		return index.ErrPostings(err)
-	}
-	return index.NewListPostings(seriesRefs)
+	return index.Intersect(
+		index.NewListPostings(h.staleSeriesRefs),
+		h.head.postings.PostingsForLabelMatching(ctx, name, match),
+	)
 }
 
 func (h *headStaleIndexReader) PostingsForAllLabelValues(ctx context.Context, name string) index.Postings {
 	// Unused for compaction, so we don't need to optimise.
-	seriesRefs, err := h.head.filterStaleSeriesAndSortPostings(h.head.postings.PostingsForAllLabelValues(ctx, name))
-	if err != nil {
-		return index.ErrPostings(err)
-	}
-	return index.NewListPostings(seriesRefs)
+	return index.Intersect(
+		index.NewListPostings(h.staleSeriesRefs),
+		h.head.postings.PostingsForAllLabelValues(ctx, name),
+	)
 }
 
 // filterStaleSeriesAndSortPostings returns the stale series references from the given postings
